@@ -6,6 +6,8 @@ Simple training script for CEFR model
 from cefr_bert_classifier import CEFRTextAnalyzer
 import os
 import sys
+import pandas as pd
+from sklearn.model_selection import train_test_split
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 
@@ -27,20 +29,55 @@ def main():
     )
 
     # Check if training data exists
-    train_file = 'dataset/train.csv'
-    val_file = 'dataset/validation.csv'
+    dataset_file = 'dataset/dataset.csv'
 
-    if not (os.path.exists(train_file) and os.path.exists(val_file)):
+    if not os.path.exists(dataset_file):
         print("❌ Training data not found!")
-        print("Please ensure dataset/train.csv and dataset/validation.csv exist")
+        print("Please ensure dataset/dataset.csv exists")
         return
 
-    # Train the model
+    # Load and split data
+    print("📊 Loading dataset...")
+    df = pd.read_csv(dataset_file)
+    print(f"📊 Total samples: {len(df)}")
+
+    # Split data into train, validation and test sets (70-15-15 split)
+    # First split: 70% train, 30% temp (which will be split into val and test)
+    train_data, temp_data = train_test_split(
+        df,
+        test_size=0.3,
+        random_state=42,
+        stratify=df['label']  # Ensure balanced split across labels
+    )
+
+    # Second split: Split the 30% temp into 15% validation and 15% test
+    val_data, test_data = train_test_split(
+        temp_data,
+        test_size=0.5,  # 50% of 30% = 15% of total
+        random_state=42,
+        stratify=temp_data['label']
+    )
+
+    print(
+        f"📊 Training samples: {len(train_data)} ({len(train_data)/len(df)*100:.1f}%)")
+    print(
+        f"📊 Validation samples: {len(val_data)} ({len(val_data)/len(df)*100:.1f}%)")
+    print(
+        f"📊 Test samples: {len(test_data)} ({len(test_data)/len(df)*100:.1f}%)")
+
+    # Train the model using DataFrames directly
     print("🚀 Starting training...")
-    analyzer.train(train_file, val_file, epochs=3, best_model_path=model_path)
+    analyzer.train_from_dataframes(
+        train_data, val_data, epochs=3, best_model_path=model_path)
 
     print(f"✅ Best model saved as {model_path}")
-    print("🎉 Training completed!")
+
+    # Test the model on test set
+    print("🧪 Testing model on test set...")
+    test_accuracy = analyzer.evaluate_dataframe(test_data)
+    print(f"🎯 Final Test Accuracy: {test_accuracy:.4f}")
+
+    print("🎉 Training and testing completed!")
 
 
 if __name__ == "__main__":

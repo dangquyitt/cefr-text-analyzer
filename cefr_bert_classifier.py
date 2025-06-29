@@ -234,6 +234,127 @@ class CEFRTextAnalyzer:
         print(
             f"🎉 Training completed! Best validation accuracy: {best_val_acc:.4f}")
 
+    def train_from_dataframes(self, train_df, val_df, epochs=3, best_model_path=None):
+        """Train the model from pandas DataFrames with improved GPU/CPU handling"""
+        # Extract texts and labels from dataframes
+        train_texts = train_df['text'].tolist()
+        val_texts = val_df['text'].tolist()
+
+        # Map CEFR labels to numerical values (0-5)
+        label_mapping = {
+            'A1': 0, 'A2': 1, 'B1': 2, 'B2': 3, 'C1': 4, 'C2': 5
+        }
+
+        train_labels = train_df['label'].map(label_mapping).values
+        val_labels = val_df['label'].map(label_mapping).values
+
+        print(f"📊 Training samples: {len(train_texts)}")
+        print(f"📊 Validation samples: {len(val_texts)}")
+
+        # Create data loaders
+        train_loader = self.create_data_loader(
+            train_texts, train_labels, shuffle=True)
+        val_loader = self.create_data_loader(
+            val_texts, val_labels, shuffle=False)
+
+        # Setup optimizer and scheduler
+        optimizer = AdamW(self.model.parameters(),
+                          lr=self.learning_rate, weight_decay=0.01)
+        total_steps = len(train_loader) * epochs
+        scheduler = get_linear_schedule_with_warmup(
+            optimizer,
+            num_warmup_steps=int(0.1 * total_steps),  # 10% warmup
+            num_training_steps=total_steps
+        )
+
+        loss_fn = torch.nn.CrossEntropyLoss()
+
+        # Mixed precision scaler for GPU
+        scaler = torch.amp.GradScaler() if self.use_mixed_precision else None
+
+        # Training loop
+        print(f"🚀 Starting training for {epochs} epochs...")
+        print(f"📈 Total training steps: {total_steps}")
+
+        best_val_acc = 0.0
+
+        for epoch in range(epochs):
+            self.model.train()
+            total_loss = 0
+            correct_predictions = 0
+            total_predictions = 0
+
+            progress_bar = tqdm(
+                train_loader, desc=f'Epoch {epoch + 1}/{epochs}')
+
+            for batch_idx, batch in enumerate(progress_bar):
+                input_ids = batch['input_ids'].to(
+                    self.device, non_blocking=True)
+                attention_mask = batch['attention_mask'].to(
+                    self.device, non_blocking=True)
+                labels = batch['labels'].to(self.device, non_blocking=True)
+
+                optimizer.zero_grad()
+
+                # Forward pass with mixed precision if available
+                if self.use_mixed_precision and scaler is not None:
+                    with torch.amp.autocast(device_type=self.device.type):
+                        outputs = self.model(input_ids, attention_mask)
+                        loss = loss_fn(outputs, labels)
+
+                    # Backward pass with scaling
+                    scaler.scale(loss).backward()
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    outputs = self.model(input_ids, attention_mask)
+                    loss = loss_fn(outputs, labels)
+                    loss.backward()
+                    optimizer.step()
+
+                scheduler.step()
+
+                total_loss += loss.item()
+
+                # Calculate accuracy
+                _, preds = torch.max(outputs, dim=1)
+                correct_predictions += torch.sum(preds == labels)
+                total_predictions += labels.size(0)
+
+                # Update progress bar
+                current_acc = correct_predictions / total_predictions
+                progress_bar.set_postfix({
+                    'loss': f'{loss.item():.4f}',
+                    'acc': f'{current_acc:.4f}',
+                    'lr': f'{scheduler.get_last_lr()[0]:.2e}'
+                })
+
+                # Clear cache periodically for GPU
+                if self.device.type == 'cuda' and batch_idx % 10 == 0:
+                    torch.cuda.empty_cache()
+
+            # Validation
+            val_accuracy = self.evaluate(val_loader)
+            avg_loss = total_loss / len(train_loader)
+            train_accuracy = correct_predictions / total_predictions
+
+            print(f'Epoch {epoch + 1}/{epochs}:')
+            print(f'  📉 Train Loss: {avg_loss:.4f}')
+            print(f'  🎯 Train Accuracy: {train_accuracy:.4f}')
+            print(f'  ✅ Validation Accuracy: {val_accuracy:.4f}')
+
+            # Save best model
+            if val_accuracy > best_val_acc:
+                best_val_acc = val_accuracy
+                print(f'  🏆 New best validation accuracy: {best_val_acc:.4f}')
+                if best_model_path:
+                    self.save_model(best_model_path)
+
+            print('-' * 50)
+
+        print(
+            f"🎉 Training completed! Best validation accuracy: {best_val_acc:.4f}")
+
     def evaluate(self, data_loader):
         """Evaluate the model with improved efficiency"""
         self.model.eval()
@@ -456,6 +577,24 @@ class CEFRTextAnalyzer:
         """Convert CEFR labels to numerical predictions (0-5)"""
         label_mapping = {'A1': 0, 'A2': 1, 'B1': 2, 'B2': 3, 'C1': 4, 'C2': 5}
         return [label_mapping[label] for label in cefr_labels]
+
+    def evaluate_dataframe(self, df):
+        """Evaluate the model on a DataFrame"""
+        # Extract texts and labels from dataframe
+        texts = df['text'].tolist()
+
+        # Map CEFR labels to numerical values (0-5)
+        label_mapping = {
+            'A1': 0, 'A2': 1, 'B1': 2, 'B2': 3, 'C1': 4, 'C2': 5
+        }
+
+        labels = df['label'].map(label_mapping).values
+
+        # Create data loader
+        data_loader = self.create_data_loader(texts, labels, shuffle=False)
+
+        # Use existing evaluate method
+        return self.evaluate(data_loader)
 
 
 def main():

@@ -40,6 +40,8 @@ def main():
     print("📊 Loading dataset...")
     df = pd.read_csv(dataset_file)
     print(f"📊 Total samples: {len(df)}")
+    print(f"📊 Label distribution:")
+    print(df['label'].value_counts())
 
     # Split data into train, validation and test sets (70-15-15 split)
     # First split: 70% train, 30% temp (which will be split into val and test)

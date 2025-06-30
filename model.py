@@ -1,14 +1,14 @@
 import pandas as pd
 import numpy as np
 import torch
+from torch import nn
 from torch.utils.data import Dataset, DataLoader
 from transformers import AutoTokenizer, AutoModel, get_linear_schedule_with_warmup
 from torch.optim import AdamW
-from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
+from sklearn.metrics import accuracy_score, classification_report, confusion_matrix, f1_score
 from tqdm import tqdm
 import warnings
 import os
-from accelerate import Accelerator
 warnings.filterwarnings('ignore')
 
 
@@ -37,60 +37,96 @@ class CEFRDataset(Dataset):
         return {
             'input_ids': encoding['input_ids'].flatten(),
             'attention_mask': encoding['attention_mask'].flatten(),
-            'labels': torch.tensor(label, dtype=torch.long)
+            'label': torch.tensor(label, dtype=torch.long)
         }
 
 
-class CEFRClassifier(torch.nn.Module):
-    def __init__(self, model_name='bert-base-uncased', num_classes=6, dropout_rate=0.3):
+def mean_pooling(token_embeddings, attention_mask):
+    """Apply mean pooling to get sentence embeddings"""
+    input_mask_expanded = attention_mask.unsqueeze(
+        -1).expand(token_embeddings.size()).float()
+    return torch.sum(token_embeddings * input_mask_expanded, 1) / torch.clamp(input_mask_expanded.sum(1), min=1e-9)
+
+
+class CEFRClassifier(nn.Module):
+    def __init__(self, model_name='bert-base-uncased', num_classes=6, dropout_rate=0.3,
+                 use_weighted_loss=True, class_weights=None):
         super(CEFRClassifier, self).__init__()
         self.bert = AutoModel.from_pretrained(model_name)
-        self.dropout = torch.nn.Dropout(dropout_rate)
-        self.classifier = torch.nn.Linear(
-            self.bert.config.hidden_size, num_classes)
+        self.dropout = nn.Dropout(dropout_rate)
+        self.classifier = nn.Linear(self.bert.config.hidden_size, num_classes)
+
+        # Initialize classifier weights
+        nn.init.xavier_normal_(self.classifier.weight)
+        nn.init.zeros_(self.classifier.bias)
+
+        self.use_weighted_loss = use_weighted_loss
+        self.class_weights = class_weights
 
     def forward(self, input_ids, attention_mask):
-        outputs = self.bert(input_ids=input_ids, attention_mask=attention_mask)
-        pooled_output = outputs.pooler_output
-        output = self.dropout(pooled_output)
-        return self.classifier(output)
+        # Get BERT outputs
+        outputs = self.bert(input_ids=input_ids, attention_mask=attention_mask,
+                            output_hidden_states=True)
+
+        # Use mean pooling instead of [CLS] token
+        last_hidden_state = outputs.last_hidden_state
+        sentence_embeddings = mean_pooling(last_hidden_state, attention_mask)
+
+        # Apply dropout and classification
+        output = self.dropout(sentence_embeddings)
+        logits = self.classifier(output)
+
+        return logits
 
 
 class CEFRTextAnalyzer:
-    def __init__(self, model_name='bert-base-uncased', max_length=128, batch_size=16, learning_rate=2e-5):
+    def __init__(self, model_name='bert-base-uncased', max_length=128, batch_size=16,
+                 learning_rate=2e-5, use_weighted_loss=True, alpha=0.5):
         self.model_name = model_name
         self.max_length = max_length
         self.batch_size = batch_size
         self.learning_rate = learning_rate
+        self.use_weighted_loss = use_weighted_loss
+        self.alpha = alpha  # For loss weighting
+        self.num_classes = 6  # A1, A2, B1, B2, C1, C2
 
-        # Improved device detection and setup
+        # Device setup - more conservative approach for stability
         if torch.cuda.is_available():
             self.device = torch.device('cuda')
             print(
                 f"🚀 CUDA detected! Using GPU: {torch.cuda.get_device_name(0)}")
-            print(
-                f"GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
-            # Clear cache for better memory management
             torch.cuda.empty_cache()
         elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
-            self.device = torch.device('mps')
-            print("🍎 MPS (Apple Silicon) detected! Using MPS acceleration")
+            # MPS can be unstable with some models, so let's be more cautious
+            try:
+                self.device = torch.device('mps')
+                print("🍎 MPS (Apple Silicon) detected! Testing MPS...")
+                # Test MPS with a small tensor operation
+                test_tensor = torch.randn(2, 2).to(self.device)
+                _ = test_tensor @ test_tensor  # Simple matrix multiplication test
+                print("✅ MPS test passed - using MPS acceleration")
+            except Exception as e:
+                print(f"⚠️  MPS test failed: {e}")
+                print("🔄 Falling back to CPU for stability")
+                self.device = torch.device('cpu')
         else:
             self.device = torch.device('cpu')
-            print("💻 Using CPU (consider using GPU for faster training)")
+            print("💻 Using CPU")
 
-        # Initialize tokenizer and model
+        # Initialize tokenizer
         print(f"📦 Loading tokenizer: {model_name}")
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
 
+        # Initialize model
         print(f"🤖 Loading model: {model_name}")
-        self.model = CEFRClassifier(model_name)
+        self.model = CEFRClassifier(model_name, num_classes=self.num_classes)
         self.model.to(self.device)
 
-        # Enable mixed precision for GPU
-        self.use_mixed_precision = self.device.type in ['cuda', 'mps']
-        if self.use_mixed_precision:
-            print("⚡ Mixed precision training enabled for faster training")
+        # Label mapping
+        self.label_mapping = {'A1': 0, 'A2': 1,
+                              'B1': 2, 'B2': 3, 'C1': 4, 'C2': 5}
+        self.reverse_label_mapping = {
+            v: k for k, v in self.label_mapping.items()}
 
         print(f"✅ Model initialized on {self.device}")
 
@@ -101,18 +137,30 @@ class CEFRTextAnalyzer:
         print(f"📊 Total parameters: {total_params:,}")
         print(f"📊 Trainable parameters: {trainable_params:,}")
 
+    def compute_class_weights(self, labels, epsilon=1e-5):
+        """Compute class weights for handling class imbalance"""
+        unique_labels, counts = np.unique(labels, return_counts=True)
+        class_ratios = counts / np.sum(counts)
+
+        # Apply power scaling (similar to CEFR-SP approach)
+        weights = np.power(class_ratios, self.alpha) / \
+            np.sum(np.power(class_ratios, self.alpha))
+        weights = weights / (class_ratios + epsilon)
+
+        # Create full weight tensor for all classes
+        full_weights = np.ones(self.num_classes)
+        for i, label in enumerate(unique_labels):
+            full_weights[label] = weights[i]
+
+        return torch.FloatTensor(full_weights).to(self.device)
+
     def load_data(self, file_path):
         """Load data from CSV file with text,label format"""
         df = pd.read_csv(file_path)
         texts = df['text'].tolist()
 
-        # Map CEFR labels to numerical values (0-5)
-        label_mapping = {
-            'A1': 0, 'A2': 1, 'B1': 2, 'B2': 3, 'C1': 4, 'C2': 5
-        }
-
-        # Convert string labels to numerical labels
-        labels = df['label'].map(label_mapping).values
+        # Convert CEFR labels to numerical values
+        labels = df['label'].map(self.label_mapping).values
 
         return texts, labels
 
@@ -122,7 +170,7 @@ class CEFRTextAnalyzer:
         return DataLoader(dataset, batch_size=self.batch_size, shuffle=shuffle)
 
     def train(self, train_file, val_file, epochs=3, best_model_path=None):
-        """Train the model with improved GPU/CPU handling"""
+        """Train the model with improved classification approach"""
         # Load data
         train_texts, train_labels = self.load_data(train_file)
         val_texts, val_labels = self.load_data(val_file)
@@ -130,6 +178,12 @@ class CEFRTextAnalyzer:
         print(f"📊 Training samples: {len(train_texts)}")
         print(f"📊 Validation samples: {len(val_texts)}")
 
+        # Compute class weights for handling imbalanced data
+        class_weights = None
+        if self.use_weighted_loss:
+            class_weights = self.compute_class_weights(train_labels)
+            print(f"📊 Class weights computed: {class_weights}")
+
         # Create data loaders
         train_loader = self.create_data_loader(
             train_texts, train_labels, shuffle=True)
@@ -142,26 +196,31 @@ class CEFRTextAnalyzer:
         total_steps = len(train_loader) * epochs
         scheduler = get_linear_schedule_with_warmup(
             optimizer,
-            num_warmup_steps=int(0.1 * total_steps),  # 10% warmup
+            num_warmup_steps=int(0.1 * total_steps),
             num_training_steps=total_steps
         )
 
-        loss_fn = torch.nn.CrossEntropyLoss()
+        # Loss function with optional class weights
+        if class_weights is not None:
+            loss_fn = nn.CrossEntropyLoss(weight=class_weights)
+        else:
+            loss_fn = nn.CrossEntropyLoss()
 
-        # Mixed precision scaler for GPU
-        scaler = torch.amp.GradScaler() if self.use_mixed_precision else None
-
-        # Training loop
         print(f"🚀 Starting training for {epochs} epochs...")
         print(f"📈 Total training steps: {total_steps}")
 
-        best_val_acc = 0.0
+        best_val_f1 = 0.0
+        train_losses = []
+        val_accuracies = []
 
         for epoch in range(epochs):
+            # Training phase
             self.model.train()
             total_loss = 0
             correct_predictions = 0
             total_predictions = 0
+            all_train_preds = []
+            all_train_labels = []
 
             progress_bar = tqdm(
                 train_loader, desc=f'Epoch {epoch + 1}/{epochs}')
@@ -171,34 +230,32 @@ class CEFRTextAnalyzer:
                     self.device, non_blocking=True)
                 attention_mask = batch['attention_mask'].to(
                     self.device, non_blocking=True)
-                labels = batch['labels'].to(self.device, non_blocking=True)
+                labels = batch['label'].to(self.device, non_blocking=True)
 
                 optimizer.zero_grad()
 
-                # Forward pass with mixed precision if available
-                if self.use_mixed_precision and scaler is not None:
-                    with torch.amp.autocast(device_type=self.device.type):
-                        outputs = self.model(input_ids, attention_mask)
-                        loss = loss_fn(outputs, labels)
+                # Forward pass
+                logits = self.model(input_ids, attention_mask)
+                loss = loss_fn(logits, labels)
 
-                    # Backward pass with scaling
-                    scaler.scale(loss).backward()
-                    scaler.step(optimizer)
-                    scaler.update()
-                else:
-                    outputs = self.model(input_ids, attention_mask)
-                    loss = loss_fn(outputs, labels)
-                    loss.backward()
-                    optimizer.step()
-
+                # Backward pass
+                loss.backward()
+                # Gradient clipping for stability
+                torch.nn.utils.clip_grad_norm_(
+                    self.model.parameters(), max_norm=1.0)
+                optimizer.step()
                 scheduler.step()
 
                 total_loss += loss.item()
 
                 # Calculate accuracy
-                _, preds = torch.max(outputs, dim=1)
+                _, preds = torch.max(logits, dim=1)
                 correct_predictions += torch.sum(preds == labels)
                 total_predictions += labels.size(0)
+
+                # Store predictions for F1 calculation
+                all_train_preds.extend(preds.cpu().numpy())
+                all_train_labels.extend(labels.cpu().numpy())
 
                 # Update progress bar
                 current_acc = correct_predictions / total_predictions
@@ -208,48 +265,57 @@ class CEFRTextAnalyzer:
                     'lr': f'{scheduler.get_last_lr()[0]:.2e}'
                 })
 
-                # Clear cache periodically for GPU
+                # Clear cache periodically
                 if self.device.type == 'cuda' and batch_idx % 10 == 0:
                     torch.cuda.empty_cache()
 
-            # Validation
-            val_accuracy = self.evaluate(val_loader)
+            # Calculate training metrics
             avg_loss = total_loss / len(train_loader)
             train_accuracy = correct_predictions / total_predictions
+            train_f1 = f1_score(
+                all_train_labels, all_train_preds, average='macro')
+            train_losses.append(avg_loss)
+
+            # Validation phase
+            val_accuracy, val_f1, val_preds, val_true = self.evaluate_detailed(
+                val_loader)
+            val_accuracies.append(val_accuracy)
 
             print(f'Epoch {epoch + 1}/{epochs}:')
             print(f'  📉 Train Loss: {avg_loss:.4f}')
-            print(f'  🎯 Train Accuracy: {train_accuracy:.4f}')
-            print(f'  ✅ Validation Accuracy: {val_accuracy:.4f}')
+            print(
+                f'  🎯 Train Accuracy: {train_accuracy:.4f}, F1: {train_f1:.4f}')
+            print(f'  ✅ Val Accuracy: {val_accuracy:.4f}, F1: {val_f1:.4f}')
 
-            # Save best model
-            if val_accuracy > best_val_acc:
-                best_val_acc = val_accuracy
-                print(f'  🏆 New best validation accuracy: {best_val_acc:.4f}')
+            # Save best model based on F1 score
+            if val_f1 > best_val_f1:
+                best_val_f1 = val_f1
+                print(f'  🏆 New best validation F1: {best_val_f1:.4f}')
                 if best_model_path:
                     self.save_model(best_model_path)
 
             print('-' * 50)
 
-        print(
-            f"🎉 Training completed! Best validation accuracy: {best_val_acc:.4f}")
+        print(f"🎉 Training completed! Best validation F1: {best_val_f1:.4f}")
+        return train_losses, val_accuracies
 
     def train_from_dataframes(self, train_df, val_df, epochs=3, best_model_path=None):
-        """Train the model from pandas DataFrames with improved GPU/CPU handling"""
+        """Train the model from pandas DataFrames"""
         # Extract texts and labels from dataframes
         train_texts = train_df['text'].tolist()
         val_texts = val_df['text'].tolist()
 
-        # Map CEFR labels to numerical values (0-5)
-        label_mapping = {
-            'A1': 0, 'A2': 1, 'B1': 2, 'B2': 3, 'C1': 4, 'C2': 5
-        }
-
-        train_labels = train_df['label'].map(label_mapping).values
-        val_labels = val_df['label'].map(label_mapping).values
+        train_labels = train_df['label'].map(self.label_mapping).values
+        val_labels = val_df['label'].map(self.label_mapping).values
 
         print(f"📊 Training samples: {len(train_texts)}")
         print(f"📊 Validation samples: {len(val_texts)}")
+
+        # Compute class weights
+        class_weights = None
+        if self.use_weighted_loss:
+            class_weights = self.compute_class_weights(train_labels)
+            print(f"📊 Class weights computed: {class_weights}")
 
         # Create data loaders
         train_loader = self.create_data_loader(
@@ -263,26 +329,27 @@ class CEFRTextAnalyzer:
         total_steps = len(train_loader) * epochs
         scheduler = get_linear_schedule_with_warmup(
             optimizer,
-            num_warmup_steps=int(0.1 * total_steps),  # 10% warmup
+            num_warmup_steps=int(0.1 * total_steps),
             num_training_steps=total_steps
         )
 
-        loss_fn = torch.nn.CrossEntropyLoss()
+        # Loss function
+        if class_weights is not None:
+            loss_fn = nn.CrossEntropyLoss(weight=class_weights)
+        else:
+            loss_fn = nn.CrossEntropyLoss()
 
-        # Mixed precision scaler for GPU
-        scaler = torch.amp.GradScaler() if self.use_mixed_precision else None
-
-        # Training loop
         print(f"🚀 Starting training for {epochs} epochs...")
-        print(f"📈 Total training steps: {total_steps}")
-
-        best_val_acc = 0.0
+        best_val_f1 = 0.0
 
         for epoch in range(epochs):
+            # Training phase
             self.model.train()
             total_loss = 0
             correct_predictions = 0
             total_predictions = 0
+            all_train_preds = []
+            all_train_labels = []
 
             progress_bar = tqdm(
                 train_loader, desc=f'Epoch {epoch + 1}/{epochs}')
@@ -292,36 +359,28 @@ class CEFRTextAnalyzer:
                     self.device, non_blocking=True)
                 attention_mask = batch['attention_mask'].to(
                     self.device, non_blocking=True)
-                labels = batch['labels'].to(self.device, non_blocking=True)
+                labels = batch['label'].to(self.device, non_blocking=True)
 
                 optimizer.zero_grad()
 
-                # Forward pass with mixed precision if available
-                if self.use_mixed_precision and scaler is not None:
-                    with torch.amp.autocast(device_type=self.device.type):
-                        outputs = self.model(input_ids, attention_mask)
-                        loss = loss_fn(outputs, labels)
+                logits = self.model(input_ids, attention_mask)
+                loss = loss_fn(logits, labels)
 
-                    # Backward pass with scaling
-                    scaler.scale(loss).backward()
-                    scaler.step(optimizer)
-                    scaler.update()
-                else:
-                    outputs = self.model(input_ids, attention_mask)
-                    loss = loss_fn(outputs, labels)
-                    loss.backward()
-                    optimizer.step()
-
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(
+                    self.model.parameters(), max_norm=1.0)
+                optimizer.step()
                 scheduler.step()
 
                 total_loss += loss.item()
 
-                # Calculate accuracy
-                _, preds = torch.max(outputs, dim=1)
+                _, preds = torch.max(logits, dim=1)
                 correct_predictions += torch.sum(preds == labels)
                 total_predictions += labels.size(0)
 
-                # Update progress bar
+                all_train_preds.extend(preds.cpu().numpy())
+                all_train_labels.extend(labels.cpu().numpy())
+
                 current_acc = correct_predictions / total_predictions
                 progress_bar.set_postfix({
                     'loss': f'{loss.item():.4f}',
@@ -329,37 +388,46 @@ class CEFRTextAnalyzer:
                     'lr': f'{scheduler.get_last_lr()[0]:.2e}'
                 })
 
-                # Clear cache periodically for GPU
                 if self.device.type == 'cuda' and batch_idx % 10 == 0:
                     torch.cuda.empty_cache()
 
-            # Validation
-            val_accuracy = self.evaluate(val_loader)
+            # Calculate metrics
             avg_loss = total_loss / len(train_loader)
             train_accuracy = correct_predictions / total_predictions
+            train_f1 = f1_score(
+                all_train_labels, all_train_preds, average='macro')
+
+            # Validation
+            val_accuracy, val_f1, _, _ = self.evaluate_detailed(val_loader)
 
             print(f'Epoch {epoch + 1}/{epochs}:')
             print(f'  📉 Train Loss: {avg_loss:.4f}')
-            print(f'  🎯 Train Accuracy: {train_accuracy:.4f}')
-            print(f'  ✅ Validation Accuracy: {val_accuracy:.4f}')
+            print(
+                f'  🎯 Train Accuracy: {train_accuracy:.4f}, F1: {train_f1:.4f}')
+            print(f'  ✅ Val Accuracy: {val_accuracy:.4f}, F1: {val_f1:.4f}')
 
-            # Save best model
-            if val_accuracy > best_val_acc:
-                best_val_acc = val_accuracy
-                print(f'  🏆 New best validation accuracy: {best_val_acc:.4f}')
+            if val_f1 > best_val_f1:
+                best_val_f1 = val_f1
+                print(f'  🏆 New best validation F1: {best_val_f1:.4f}')
                 if best_model_path:
                     self.save_model(best_model_path)
 
             print('-' * 50)
 
-        print(
-            f"🎉 Training completed! Best validation accuracy: {best_val_acc:.4f}")
+        print(f"🎉 Training completed! Best validation F1: {best_val_f1:.4f}")
 
     def evaluate(self, data_loader):
-        """Evaluate the model with improved efficiency"""
+        """Simple evaluate method for backward compatibility"""
+        accuracy, _, _, _ = self.evaluate_detailed(data_loader)
+        return accuracy
+
+    def evaluate_detailed(self, data_loader):
+        """Detailed evaluation with accuracy, F1, predictions and true labels"""
         self.model.eval()
         correct_predictions = 0
         total_predictions = 0
+        all_predictions = []
+        all_true_labels = []
 
         with torch.no_grad():
             for batch in tqdm(data_loader, desc="Evaluating", leave=False):
@@ -367,20 +435,21 @@ class CEFRTextAnalyzer:
                     self.device, non_blocking=True)
                 attention_mask = batch['attention_mask'].to(
                     self.device, non_blocking=True)
-                labels = batch['labels'].to(self.device, non_blocking=True)
+                labels = batch['label'].to(self.device, non_blocking=True)
 
-                # Use mixed precision for inference if available
-                if self.use_mixed_precision:
-                    with torch.amp.autocast(device_type=self.device.type):
-                        outputs = self.model(input_ids, attention_mask)
-                else:
-                    outputs = self.model(input_ids, attention_mask)
+                logits = self.model(input_ids, attention_mask)
+                _, preds = torch.max(logits, dim=1)
 
-                _, preds = torch.max(outputs, dim=1)
                 correct_predictions += torch.sum(preds == labels)
                 total_predictions += labels.size(0)
 
-        return correct_predictions / total_predictions
+                all_predictions.extend(preds.cpu().numpy())
+                all_true_labels.extend(labels.cpu().numpy())
+
+        accuracy = correct_predictions / total_predictions
+        f1 = f1_score(all_true_labels, all_predictions, average='macro')
+
+        return accuracy.item(), f1, all_predictions, all_true_labels
 
     def test(self, test_file):
         """Test the model and generate detailed results"""
@@ -388,48 +457,31 @@ class CEFRTextAnalyzer:
         test_loader = self.create_data_loader(
             test_texts, test_labels, shuffle=False)
 
-        self.model.eval()
-        predictions = []
-        true_labels = []
-
         print("Testing model...")
-        with torch.no_grad():
-            for batch in tqdm(test_loader):
-                input_ids = batch['input_ids'].to(self.device)
-                attention_mask = batch['attention_mask'].to(self.device)
-                labels = batch['labels'].to(self.device)
+        accuracy, f1, predictions, true_labels = self.evaluate_detailed(
+            test_loader)
 
-                outputs = self.model(input_ids, attention_mask)
-                _, preds = torch.max(outputs, dim=1)
-
-                predictions.extend(preds.cpu().numpy())
-                true_labels.extend(labels.cpu().numpy())
-
-        # Keep in 0-5 range for internal calculations
-        predictions = np.array(predictions)
-        true_labels = np.array(true_labels)
-
-        # Calculate metrics
-        accuracy = accuracy_score(true_labels, predictions)
         print(f"Test Accuracy: {accuracy:.4f}")
+        print(f"Test F1 Score (Macro): {f1:.4f}")
 
         # Classification report
         cefr_levels = ['A1', 'A2', 'B1', 'B2', 'C1', 'C2']
-        labels = list(range(6))  # 0-5 for CEFR levels
         print("\nClassification Report:")
         print(classification_report(true_labels, predictions,
-                                    labels=labels, target_names=cefr_levels,
+                                    labels=list(range(6)), target_names=cefr_levels,
                                     digits=4, zero_division=0))
 
         # Confusion matrix
-        cm = confusion_matrix(true_labels, predictions, labels=labels)
+        cm = confusion_matrix(true_labels, predictions, labels=list(range(6)))
         print(f"\nConfusion Matrix:")
-        print(cm)
+        print("      ", " ".join(f"{level:>4}" for level in cefr_levels))
+        for i, level in enumerate(cefr_levels):
+            print(f"{level}: ", " ".join(f"{cm[i][j]:>4}" for j in range(6)))
 
-        return accuracy, predictions, true_labels
+        return accuracy, f1, predictions, true_labels
 
     def predict_text(self, text):
-        """Predict CEFR level for a single text with improved efficiency"""
+        """Predict CEFR level for a single text"""
         self.model.eval()
 
         encoding = self.tokenizer(
@@ -445,27 +497,19 @@ class CEFRTextAnalyzer:
             self.device, non_blocking=True)
 
         with torch.no_grad():
-            # Use mixed precision for inference if available
-            if self.use_mixed_precision:
-                with torch.amp.autocast(device_type=self.device.type):
-                    outputs = self.model(input_ids, attention_mask)
-            else:
-                outputs = self.model(input_ids, attention_mask)
+            logits = self.model(input_ids, attention_mask)
 
             # Get probabilities and prediction
-            probabilities = torch.softmax(outputs, dim=1)
+            probabilities = torch.softmax(logits, dim=1)
             confidence = probabilities.max().item()
-            _, prediction = torch.max(outputs, dim=1)
+            _, prediction = torch.max(logits, dim=1)
 
-        cefr_levels = ['A1', 'A2', 'B1', 'B2', 'C1', 'C2']
-        predicted_level = cefr_levels[prediction.item()]
-
+        predicted_level = self.reverse_label_mapping[prediction.item()]
         return predicted_level, confidence
 
     def predict_batch(self, texts):
         """Predict CEFR levels for multiple texts efficiently"""
         self.model.eval()
-
         results = []
 
         # Process in batches for efficiency
@@ -490,73 +534,65 @@ class CEFRTextAnalyzer:
                     self.device, non_blocking=True)
 
                 # Predict
-                if self.use_mixed_precision:
-                    with torch.amp.autocast(device_type=self.device.type):
-                        outputs = self.model(input_ids, attention_mask)
-                else:
-                    outputs = self.model(input_ids, attention_mask)
+                logits = self.model(input_ids, attention_mask)
 
                 # Get probabilities and predictions
-                probabilities = torch.softmax(outputs, dim=1)
+                probabilities = torch.softmax(logits, dim=1)
                 confidences = probabilities.max(dim=1)[0].cpu().numpy()
-                predictions = torch.max(outputs, dim=1)[1].cpu().numpy()
+                predictions = torch.max(logits, dim=1)[1].cpu().numpy()
 
                 # Convert to CEFR levels
-                cefr_levels = ['A1', 'A2', 'B1', 'B2', 'C1', 'C2']
                 for j, (pred, conf) in enumerate(zip(predictions, confidences)):
                     results.append({
                         'sentence': batch_texts[j],
-                        'cefr': cefr_levels[pred],
+                        'cefr': self.reverse_label_mapping[pred],
                         'confidence': float(conf)
                     })
 
         return results
 
     def save_model(self, path):
-        """Save the trained model with improved metadata"""
+        """Save the trained model with metadata"""
         model_info = {
             'model_state_dict': self.model.state_dict(),
             'model_name': self.model_name,
             'max_length': self.max_length,
             'batch_size': self.batch_size,
             'learning_rate': self.learning_rate,
+            'use_weighted_loss': self.use_weighted_loss,
+            'alpha': self.alpha,
+            'num_classes': self.num_classes,
+            'label_mapping': self.label_mapping,
             'device_type': self.device.type,
             'torch_version': torch.__version__,
-            'transformers_version': getattr(__import__('transformers'), '__version__', 'unknown')
         }
 
         torch.save(model_info, path)
         print(f"💾 Model saved to {path}")
 
-        # Save model size info
+        # Model size info
         model_size = os.path.getsize(path) / (1024 * 1024)  # MB
         print(f"📊 Model size: {model_size:.1f} MB")
 
     def load_model(self, path):
-        """Load a trained model with compatibility checks"""
+        """Load a trained model"""
         try:
-            # Try loading with weights_only=True first (safer)
-            try:
-                checkpoint = torch.load(
-                    path, map_location=self.device, weights_only=True)
-            except Exception as e:
-                # If weights_only=True fails, try with weights_only=False
-                print(
-                    f"⚠️  Warning: Loading with weights_only=False due to compatibility issue")
-                checkpoint = torch.load(
-                    path, map_location=self.device, weights_only=False)
-
+            checkpoint = torch.load(
+                path, map_location=self.device, weights_only=True)
             self.model.load_state_dict(checkpoint['model_state_dict'])
 
-            # Load additional info if available
+            # Load configuration if available
             if 'max_length' in checkpoint:
                 self.max_length = checkpoint['max_length']
             if 'batch_size' in checkpoint:
                 self.batch_size = checkpoint['batch_size']
+            if 'use_weighted_loss' in checkpoint:
+                self.use_weighted_loss = checkpoint['use_weighted_loss']
+            if 'alpha' in checkpoint:
+                self.alpha = checkpoint['alpha']
 
             print(f"✅ Model loaded from {path}")
 
-            # Show compatibility info
             if 'torch_version' in checkpoint:
                 print(
                     f"📦 Model trained with PyTorch {checkpoint['torch_version']}")
@@ -566,80 +602,30 @@ class CEFRTextAnalyzer:
 
         except Exception as e:
             print(f"❌ Error loading model: {e}")
-            raise
+            # Try loading without weights_only for compatibility
+            try:
+                checkpoint = torch.load(
+                    path, map_location=self.device, weights_only=False)
+                self.model.load_state_dict(checkpoint['model_state_dict'])
+                print(f"✅ Model loaded from {path} (compatibility mode)")
+            except Exception as e2:
+                print(f"❌ Failed to load model: {e2}")
+                raise
 
     def predictions_to_cefr(self, predictions):
         """Convert numerical predictions (0-5) to CEFR labels"""
-        cefr_levels = ['A1', 'A2', 'B1', 'B2', 'C1', 'C2']
-        return [cefr_levels[pred] for pred in predictions]
+        return [self.reverse_label_mapping[pred] for pred in predictions]
 
     def cefr_to_predictions(self, cefr_labels):
         """Convert CEFR labels to numerical predictions (0-5)"""
-        label_mapping = {'A1': 0, 'A2': 1, 'B1': 2, 'B2': 3, 'C1': 4, 'C2': 5}
-        return [label_mapping[label] for label in cefr_labels]
+        return [self.label_mapping[label] for label in cefr_labels]
 
     def evaluate_dataframe(self, df):
         """Evaluate the model on a DataFrame"""
-        # Extract texts and labels from dataframe
         texts = df['text'].tolist()
+        labels = df['label'].map(self.label_mapping).values
 
-        # Map CEFR labels to numerical values (0-5)
-        label_mapping = {
-            'A1': 0, 'A2': 1, 'B1': 2, 'B2': 3, 'C1': 4, 'C2': 5
-        }
-
-        labels = df['label'].map(label_mapping).values
-
-        # Create data loader
         data_loader = self.create_data_loader(texts, labels, shuffle=False)
+        accuracy, f1, _, _ = self.evaluate_detailed(data_loader)
 
-        # Use existing evaluate method
-        return self.evaluate(data_loader)
-
-
-def main():
-    # Initialize the analyzer
-    analyzer = CEFRTextAnalyzer(
-        model_name='bert-base-uncased',
-        max_length=128,
-        batch_size=8,  # Smaller batch size for stability
-        learning_rate=2e-5
-    )
-
-    # Define file paths
-    train_file = 'dataset/train.csv'
-    val_file = 'dataset/validation.csv'
-    test_file = 'dataset/test.csv'
-
-    # Train the model
-    analyzer.train(train_file, val_file, epochs=5)
-
-    # Test the model
-    accuracy, predictions, true_labels = analyzer.test(test_file)
-
-    # Save the model
-    analyzer.save_model('cefr_bert_model.pth')
-
-    # Example predictions
-    print("\n" + "="*50)
-    print("Example Predictions:")
-    print("="*50)
-
-    example_texts = [
-        "I like cats.",
-        "The weather is nice today.",
-        "She has been working on this project for several months.",
-        "The implementation requires careful consideration of multiple factors.",
-        "The sophisticated methodology demonstrates exceptional analytical rigor.",
-        "The paradigmatic shift necessitates comprehensive epistemological examination."
-    ]
-
-    for text in example_texts:
-        level, confidence = analyzer.predict_text(text)
-        print(f"Text: '{text}'")
-        print(f"Predicted CEFR Level: {level} (Confidence: {confidence:.3f})")
-        print("-" * 50)
-
-
-if __name__ == "__main__":
-    main()
+        return accuracy, f1

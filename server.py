@@ -1,4 +1,4 @@
-from cefr_bert_classifier import CEFRTextAnalyzer
+from model import CEFRTextAnalyzer
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from typing import List
@@ -24,7 +24,9 @@ def load_model():
             model_name='bert-base-uncased',
             max_length=128,
             batch_size=1,  # Single prediction
-            learning_rate=2e-5
+            learning_rate=2e-5,
+            use_weighted_loss=True,  # Match training settings
+            alpha=0.5
         )
 
         model_path = 'cefr_bert_model.pth'
